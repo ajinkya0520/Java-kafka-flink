@@ -1,7 +1,7 @@
 """
-Enhanced IPFIX Data Simulator for the 'enriched_flows' table.
-Generates realistic network flow data with extended fields and sends it directly to Kafka.
-This version is adapted to the new table schema, excluding GeoIP and IPAM fields.
+Final IPFIX Data Simulator for the 'enriched_flows' table.
+Generates realistic network flow data, including anomalies, and sends it to Kafka.
+This version completely omits GeoIP and IPAM fields from the output.
 """
 
 import ipaddress
@@ -26,24 +26,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger('enriched-ipfix-simulator')
 
-# Initialize Faker for generating realistic data
+# Initialize Faker
 fake = Faker()
 
 def random_mac():
-    """Generate a random MAC address."""
     return ':'.join([f'{random.randint(0, 255):02x}' for _ in range(6)])
 
-# Load IP address ranges from CSV file
 def load_ip_ranges(csv_file):
-    """Loads IP ranges from a CSV file."""
     ip_ranges = []
     try:
         with open(csv_file, 'r') as file:
             reader = csv.reader(file)
             for row in reader:
-                start_ip = int(row[0])
-                end_ip = int(row[1])
-                ip_ranges.append((start_ip, end_ip))
+                ip_ranges.append((int(row[0]), int(row[1])))
     except FileNotFoundError:
         logger.warning(f"IP range file '{csv_file}' not found. Using private IP ranges as a fallback.")
         return [
@@ -53,203 +48,192 @@ def load_ip_ranges(csv_file):
         ]
     return ip_ranges
 
-# Generate a random IP address from the ranges
 def generate_random_ip(ip_ranges):
-    """Generates a random IP from the loaded ranges."""
-    if not ip_ranges:
-        return fake.ipv4()
+    if not ip_ranges: return fake.ipv4()
     start_ip, end_ip = random.choice(ip_ranges)
-    random_ip_int = random.randint(start_ip, end_ip)
-    return str(ipaddress.IPv4Address(random_ip_int))
+    return str(ipaddress.IPv4Address(random.randint(start_ip, end_ip)))
 
-# Load IP ranges once
 ip_ranges = load_ip_ranges('geolite/IP2LOCATION-LITE-DB1.csv')
 
 class TrafficProfile:
-    """Defines a network traffic pattern with extended fields for the new schema."""
+    """Defines a network traffic pattern for the new schema."""
     def __init__(self, config: Dict[str, Any]):
         self.name = config['name']
         self.source_networks = config['source_networks']
         self.destination_networks = config['destination_networks']
         self.protocols = config['protocols']
         self.port_ranges = config['port_ranges']
-        self.applications = config.get('applications', ['http', 'https', 'smtp', 'dns'])
         self.flow_size_distribution = config.get('flow_size_distribution', {'type': 'lognormal', 'mean': 7.5, 'sigma': 1.5})
         self.packet_size_distribution = config.get('packet_size_distribution', {'type': 'normal', 'mean': 800, 'sigma': 400, 'min': 64, 'max': 1500})
         self.flow_duration_distribution = config.get('flow_duration_distribution', {'type': 'lognormal', 'mean': 8.0, 'sigma': 1.2})
         self.time_pattern = config.get('time_pattern', {'type': 'constant', 'flows_per_minute': 100})
-        self.retransmit_probability = config.get('retransmit_probability', 0.05)
         self.rst_probability = config.get('rst_probability', 0.02)
         self.fin_probability = config.get('fin_probability', 0.8)
 
-    def generate_ip(self) -> str:
-        """Generate a random IP within the specified network."""
-        return generate_random_ip(ip_ranges)
+    def generate_ip(self, networks: List[str]) -> str:
+        """Generate a random IP from a list of CIDR networks."""
+        network = ipaddress.ip_network(random.choice(networks))
+        return str(ipaddress.ip_address(random.randint(int(network.network_address), int(network.broadcast_address))))
 
     def generate_flow(self, timestamp: int) -> Dict[str, Any]:
-        """Generate a random flow based on this profile, matching the new schema."""
-        source_ip = self.generate_ip()
-        destination_ip = self.generate_ip()
-
+        """Generate a random flow based on this profile."""
+        source_ip = self.generate_ip(self.source_networks)
+        destination_ip = self.generate_ip(self.destination_networks)
         protocol = random.choice(self.protocols)
 
-        # Generate ports
-        if protocol in [6, 17, 132]:  # TCP, UDP, SCTP
-            source_port_range = self.port_ranges['source']
-            dest_port_range = self.port_ranges['destination']
-            source_port = random.randint(source_port_range[0], source_port_range[1])
-            destination_port = random.choice(dest_port_range)
-        else:
-            source_port = 0
-            destination_port = 0
+        source_port = random.randint(*self.port_ranges['source'])
+        destination_port = random.choice(self.port_ranges['destination'])
 
-        # Determine application
-        application_name = "unknown"
-        port_to_app = {
-            80: "http", 443: "https", 25: "smtp", 53: "dns", 22: "ssh",
-            8080: "quic", 8443: "http2", 3306: "mysql", 5432: "postgres"
-        }
-        if destination_port in port_to_app:
-            application_name = port_to_app[destination_port]
-
-        # Generate flow size and duration from original script
+        # Generate flow size and duration
         flow_size = int(np.random.lognormal(self.flow_size_distribution['mean'], self.flow_size_distribution['sigma']))
-        avg_packet_size = min(max(int(np.random.normal(self.packet_size_distribution['mean'], self.packet_size_distribution['sigma'])), self.packet_size_distribution['min']), self.packet_size_distribution['max'])
+        avg_packet_size = int(np.random.normal(self.packet_size_distribution.get('mean', 800), self.packet_size_distribution.get('sigma', 300)))
+        avg_packet_size = min(max(avg_packet_size, self.packet_size_distribution.get('min', 64)), self.packet_size_distribution.get('max', 1500))
         packet_count = max(1, int(flow_size / avg_packet_size)) if avg_packet_size > 0 else 1
         duration_ms = int(np.random.lognormal(self.flow_duration_distribution['mean'], self.flow_duration_distribution['sigma']))
 
         start_time = datetime.fromtimestamp(timestamp, tz=timezone.utc)
         end_time = start_time + timedelta(milliseconds=duration_ms)
 
-        # TCP flags
-        tcp_fin, tcp_rst, tcp_retransmits = 0, 0, 0
-        tcp_flags = 0  # Bitmask: FIN=1, SYN=2, RST=4, PSH=8, ACK=16, URG=32
-        if protocol == 6:  # TCP
-            if random.random() < self.retransmit_probability:
-                tcp_retransmits = random.randint(1, 5)
-            if random.random() < self.rst_probability:
-                tcp_rst = 1
-                tcp_flags |= 4 # Set RST bit
-            elif random.random() < self.fin_probability:
-                tcp_fin = 1
-                tcp_flags |= 1 # Set FIN bit
+        tcp_flags = 0  # Bitmask: FIN=1, RST=4
+        if protocol == 6:
+            if random.random() < self.rst_probability: tcp_flags |= 4
+            elif random.random() < self.fin_probability: tcp_flags |= 1
 
-        # Client/Server identification logic
         client_ip, client_port, server_ip, server_port = source_ip, source_port, destination_ip, destination_port
-        flow_direction = 'BIDIRECTIONAL'
-        direction_confidence = 0.5
-        direction_reason = 'UNKNOWN'
         
-        # Simple port-based direction inference
-        if 0 < destination_port < 1024 and source_port >= 1024:
-            flow_direction = 'CLIENT_TO_SERVER'
-            direction_confidence = 0.9
-            direction_reason = 'PORT_BASED'
-        elif 0 < source_port < 1024 and destination_port >= 1024:
-            client_ip, client_port, server_ip, server_port = destination_ip, destination_port, source_ip, source_port
-            flow_direction = 'SERVER_TO_CLIENT'
-            direction_confidence = 0.9
-            direction_reason = 'PORT_BASED'
-
-        # --- CONSTRUCT THE NEW FLOW RECORD ---
         now = datetime.now(timezone.utc)
         flow = {
-            # Core Identity Fields
             'flow_id': str(uuid.uuid4()),
             'flow_key': f"{source_ip}:{source_port}-{destination_ip}:{destination_port}-{protocol}",
-            
-            # Metadata fields
             'customer_id': 'customer-123',
             'flow_format': 'IPFIX',
             'exporter_id': 'exporter-01',
             'observation_domain_id': '1',
             'template_id': str(random.randint(256, 512)),
-            
-            # Network fields
             'source_ip': source_ip,
             'source_port': source_port,
             'destination_ip': destination_ip,
             'destination_port': destination_port,
             'protocol': protocol,
-            
-            # Exporter information
             'sampler_address': '192.168.1.1',
             'sequence_number': random.randint(1000, 999999),
-            
-            # Client-Server identification
             'client_ip': client_ip,
             'client_port': client_port,
             'server_ip': server_ip,
             'server_port': server_port,
-            'flow_direction': flow_direction,
-            'direction_confidence': direction_confidence,
-            'direction_reason': direction_reason,
-            
-            # Timing fields
-            'first_seen': start_time.isoformat(timespec='milliseconds'),
-            'last_seen': end_time.isoformat(timespec='milliseconds'),
+            'flow_direction': 'CLIENT_TO_SERVER',
+            'direction_confidence': 0.9,
+            'direction_reason': 'PORT_BASED',
+            'first_seen': start_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+            'last_seen': end_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
             'duration': duration_ms / 1000.0,
-            'enrichment_timestamp': now.isoformat(timespec='milliseconds'),
+            'enrichment_timestamp': now.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
             'processing_latency': random.randint(5, 50),
-            
-            # Traffic metrics (assuming unidirectional for now)
             'total_packets': packet_count,
             'total_bytes': flow_size,
             'forward_packets': packet_count,
             'forward_bytes': flow_size,
             'reverse_packets': 0,
             'reverse_bytes': 0,
-            
-            # Protocol fields
             'tcp_flags': tcp_flags,
-            'tos': random.randint(0, 255),
-            
-            # Enrichment data (to be filled later)
-            'source_dns': fake.hostname() if random.random() > 0.5 else '',
-            'destination_dns': fake.hostname() if random.random() > 0.5 else '',
-            'application': application_name,
-            
-            # --- GeoIP & IPAM FIELDS (SKIPPED as per requirement) ---
-            'source_geo_country': '', 'source_geo_country_code': '', 'source_geo_region': '',
-            'source_geo_region_code': '', 'source_geo_city': '', 'source_geo_latitude': 0.0,
-            'source_geo_longitude': 0.0, 'source_geo_timezone': '', 'source_geo_isp': '',
-            'source_geo_organization': '', 'source_geo_asn': 0, 'source_geo_asn_organization': '',
-            'destination_geo_country': '', 'destination_geo_country_code': '', 'destination_geo_region': '',
-            'destination_geo_region_code': '', 'destination_geo_city': '', 'destination_geo_latitude': 0.0,
-            'destination_geo_longitude': 0.0, 'destination_geo_timezone': '', 'destination_geo_isp': '',
-            'destination_geo_organization': '', 'destination_geo_asn': 0, 'destination_geo_asn_organization': '',
-            'source_ipam_network_name': '', 'source_ipam_network_range': '', 'source_ipam_subnet': '',
-            'source_ipam_vlan': 0, 'source_ipam_department': '', 'source_ipam_owner': '',
-            'source_ipam_description': '', 'source_ipam_location': '', 'source_ipam_environment': '',
-            'source_ipam_criticality': '',
-            'destination_ipam_network_name': '', 'destination_ipam_network_range': '', 'destination_ipam_subnet': '',
-            'destination_ipam_vlan': 0, 'destination_ipam_department': '', 'destination_ipam_owner': '',
-            'destination_ipam_description': '', 'destination_ipam_location': '', 'destination_ipam_environment': '',
-            'destination_ipam_criticality': '',
-            
-            # Custom Fields Map for extra data from original script
-            'custom_fields': {
-                'profile_name': self.name,
-                'mac_source': random_mac(),
-                'mac_destination': random_mac(),
-                'tcp_retransmits': str(tcp_retransmits),
-                'tcp_rst_flag': str(tcp_rst),
-                'tcp_fin_flag': str(tcp_fin)
-            },
-
-            # System fields
-            'ingestion_time': now.isoformat(timespec='milliseconds'),
+            'tos': 0,
+            'source_dns': '',
+            'destination_dns': '',
+            'application': 'unknown',
+            'custom_fields': {'profile_name': self.name},
+            'ingestion_time': now.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
             'data_version': 1
         }
         return flow
 
     def get_flow_rate(self, current_time: datetime) -> int:
-        """Calculate flow rate based on time pattern."""
         base_rate = self.time_pattern.get('flows_per_minute', 100)
-        # Simplified for brevity - you can copy the full logic from your original script
-        return base_rate
+        pattern_type = self.time_pattern.get('type', 'constant')
+        hour, day_of_week = current_time.hour, current_time.weekday()
+        
+        if pattern_type == 'diurnal':
+            hour_factor = 0.5 + 0.5 * np.exp(-0.5 * ((hour - 12) / 4) ** 2)
+            return int(base_rate * hour_factor)
+        elif pattern_type == 'weekly':
+            day_factor = 0.5 if day_of_week >= 5 else 1.0
+            hour_factor = 0.5 + 0.5 * np.exp(-0.5 * ((hour - 12) / 4) ** 2)
+            return int(base_rate * day_factor * hour_factor)
+        else: # constant
+            return base_rate
 
-# --- Kafka Producer and Simulator Classes (largely unchanged) ---
+class AnomalyGenerator:
+    """Generates network traffic anomalies."""
+    def __init__(self, config: Dict[str, Any]):
+        self.anomalies = config.get('anomalies', [])
+
+    def get_active_anomalies(self, current_time: datetime) -> List[Dict[str, Any]]:
+        active = []
+        for anomaly in self.anomalies:
+            start_time = datetime.fromisoformat(anomaly['start_time']).replace(tzinfo=timezone.utc)
+            end_time = datetime.fromisoformat(anomaly['end_time']).replace(tzinfo=timezone.utc)
+            if start_time <= current_time <= end_time:
+                active.append(anomaly)
+        return active
+
+    def apply_anomalies(self, flows: List[Dict[str, Any]], active_anomalies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not active_anomalies:
+            return flows
+
+        modified_flows = flows.copy()
+        now_utc = datetime.now(timezone.utc)
+        
+        for anomaly in active_anomalies:
+            anomaly_type = anomaly['type']
+
+            if anomaly_type == 'volumetric_ddos':
+                for _ in range(anomaly['flow_count']):
+                    source_ip = fake.ipv4()
+                    target_ip = anomaly['target_ip']
+                    protocol = random.choice([6, 17])
+                    start_time = now_utc - timedelta(milliseconds=random.randint(10, 100))
+                    
+                    attack_flow = {
+                        'flow_id': str(uuid.uuid4()), 'flow_key': f"{source_ip}:0-{target_ip}:0-{protocol}",
+                        'customer_id': 'customer-123', 'flow_format': 'IPFIX', 'exporter_id': 'exporter-01',
+                        'source_ip': source_ip, 'source_port': random.randint(1024, 65535),
+                        'destination_ip': target_ip, 'destination_port': anomaly.get('target_port', 80),
+                        'protocol': protocol, 'client_ip': source_ip, 'server_ip': target_ip,
+                        'first_seen': start_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+                        'last_seen': now_utc.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+                        'duration': (now_utc - start_time).total_seconds(),
+                        'total_packets': 1, 'total_bytes': random.randint(60, 1500),
+                        'forward_packets': 1, 'forward_bytes': random.randint(60, 1500),
+                        'reverse_packets': 0, 'reverse_bytes': 0, 'tcp_flags': 0, 'tos': 0,
+                        'application': 'http',
+                        'custom_fields': {'anomaly': 'True', 'anomaly_type': 'volumetric_ddos'},
+                        'ingestion_time': now_utc.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), 'data_version': 1
+                    }
+                    modified_flows.append(attack_flow)
+
+            elif anomaly_type == 'port_scan':
+                for i in range(anomaly['port_count']):
+                    source_ip = anomaly['source_ip']
+                    target_ip = anomaly['target_ip']
+                    start_time = now_utc - timedelta(milliseconds=random.randint(5, 50))
+
+                    scan_flow = {
+                        'flow_id': str(uuid.uuid4()), 'flow_key': f"{source_ip}:0-{target_ip}:{i+1}-6",
+                        'customer_id': 'customer-123', 'flow_format': 'IPFIX', 'exporter_id': 'exporter-01',
+                        'source_ip': source_ip, 'source_port': random.randint(1024, 65535),
+                        'destination_ip': target_ip, 'destination_port': i + 1,
+                        'protocol': 6, 'client_ip': source_ip, 'server_ip': target_ip,
+                        'first_seen': start_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+                        'last_seen': now_utc.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+                        'duration': (now_utc - start_time).total_seconds(),
+                        'total_packets': 1, 'total_bytes': random.randint(40, 100),
+                        'forward_packets': 1, 'forward_bytes': random.randint(40, 100),
+                        'reverse_packets': 0, 'reverse_bytes': 0, 'tcp_flags': random.choice([0, 4]), 'tos': 0,
+                        'application': 'unknown',
+                        'custom_fields': {'anomaly': 'True', 'anomaly_type': 'port_scan'},
+                        'ingestion_time': now_utc.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), 'data_version': 1
+                    }
+                    modified_flows.append(scan_flow)
+        return modified_flows
 
 class KafkaFlowProducer:
     """Sends flow data to Kafka."""
@@ -268,45 +252,33 @@ class KafkaFlowProducer:
             logger.info(f"Connected to Kafka at {self.bootstrap_servers}")
         except Exception as e:
             logger.error(f"Failed to connect to Kafka: {e}")
-            self.producer = None
 
     def send_flows(self, flows: List[Dict[str, Any]]):
-        if not self.producer:
-            logger.warning("Kafka producer not available, skipping messages")
-            return
-        try:
-            for flow in flows:
-                self.producer.send(self.topic, flow)
-            self.producer.flush()
-        except Exception as e:
-            logger.error(f"Error sending to Kafka: {e}")
-            self.connect()
+        if not self.producer: return
+        for flow in flows: self.producer.send(self.topic, flow)
+        self.producer.flush()
 
     def close(self):
-        if self.producer:
-            self.producer.close()
-            logger.info("Kafka producer closed")
-
+        if self.producer: self.producer.close()
 
 class IPFIXSimulator:
     """Main simulator class."""
     def __init__(self, config_file: str):
-        with open(config_file, 'r') as f:
-            self.config = yaml.safe_load(f)
-
+        with open(config_file, 'r') as f: self.config = yaml.safe_load(f)
+        
         kafka_config = self.config['kafka']
         self.kafka_producer = KafkaFlowProducer(kafka_config['bootstrap_servers'], kafka_config['topic'])
-
         self.profiles = [TrafficProfile(p) for p in self.config['traffic_profiles']]
-        
+        self.anomaly_generator = AnomalyGenerator(self.config.get('anomalies', {}))
+
         self.simulation_speed = self.config.get('simulation_speed', 1.0)
-        self.start_time = datetime.fromisoformat(self.config['start_time']) if self.config.get('start_time') != 'auto' else datetime.now()
-        self.end_time = datetime.fromisoformat(self.config['end_time']) if self.config.get('end_time') != 'auto' else self.start_time + timedelta(days=1)
+        self.start_time = datetime.fromisoformat(self.config['start_time']).replace(tzinfo=timezone.utc)
+        self.end_time = datetime.fromisoformat(self.config['end_time']).replace(tzinfo=timezone.utc)
         self.current_time = self.start_time
         self.running = False
 
     def start(self):
-        logger.info(f"Starting IPFIX simulation from {self.start_time} to {self.end_time}")
+        logger.info(f"Starting simulation from {self.start_time} to {self.end_time}")
         self.running = True
         self.run_simulation()
 
@@ -319,24 +291,24 @@ class IPFIXSimulator:
         while self.running and self.current_time <= self.end_time:
             all_flows = []
             for profile in self.profiles:
-                flow_rate = profile.get_flow_rate(self.current_time)
-                num_flows = max(1, int(flow_rate / 60)) # Flows per second
-                
-                for _ in range(num_flows):
-                    flow = profile.generate_flow(int(self.current_time.timestamp()))
-                    all_flows.append(flow)
+                flow_rate_per_min = profile.get_flow_rate(self.current_time)
+                num_flows_this_second = int(flow_rate_per_min / 60 * self.simulation_speed)
+                for _ in range(num_flows_this_second):
+                    all_flows.append(profile.generate_flow(int(self.current_time.timestamp())))
             
+            active_anomalies = self.anomaly_generator.get_active_anomalies(self.current_time)
+            all_flows = self.anomaly_generator.apply_anomalies(all_flows, active_anomalies)
+
             if all_flows:
                 self.kafka_producer.send_flows(all_flows)
-                logger.info(f"Sent {len(all_flows)} flows to Kafka for timestamp {self.current_time}")
+                logger.info(f"Time: {self.current_time} | Sent {len(all_flows)} flows (Anomalies active: {len(active_anomalies)})")
 
             self.current_time += timedelta(seconds=1 * self.simulation_speed)
-            time.sleep(1 / self.simulation_speed)
-
+            time.sleep(1)
 
 def main():
-    parser = argparse.ArgumentParser(description='Enhanced IPFIX Traffic Simulator for new schema')
-    parser.add_argument('--config', '-c', required=True, help='Configuration file path (e.g., config_new.yml)')
+    parser = argparse.ArgumentParser(description='Final IPFIX Traffic Simulator')
+    parser.add_argument('--config', '-c', required=True, help='Configuration file path (e.g., config_final.yml)')
     args = parser.parse_args()
 
     simulator = IPFIXSimulator(args.config)
@@ -347,7 +319,5 @@ def main():
     finally:
         simulator.stop()
 
-
 if __name__ == "__main__":
     main()
-
